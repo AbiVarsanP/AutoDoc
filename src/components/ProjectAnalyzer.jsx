@@ -4,13 +4,40 @@ import { useProject } from '../context/ProjectContext';
 import SafeIcon from '../common/SafeIcon';
 import * as FiIcons from 'react-icons/fi';
 import axios from 'axios';
+import { formatGithubError } from '../utils/githubHelpers';
 
-const { FiGitBranch, FiDownload, FiSearch, FiPackage, FiCode, FiDatabase, FiTool } = FiIcons;
+const { FiGitBranch, FiDownload, FiSearch, FiPackage, FiCode, FiDatabase, FiTool, FiKey, FiCheck, FiAlertCircle } = FiIcons;
 
 const ProjectAnalyzer = () => {
   const { state, dispatch } = useProject();
   const [localRepoUrl, setLocalRepoUrl] = useState(state.repoUrl);
   const [isCloning, setIsCloning] = useState(false);
+  const [localToken, setLocalToken] = useState(state.githubToken || '');
+  const [tokenError, setTokenError] = useState('');
+  const [userInfo, setUserInfo] = useState(null);
+
+  const handleTokenSave = async () => {
+    if (!localToken) {
+      setTokenError('Please enter a GitHub token');
+      return;
+    }
+
+    try {
+      const response = await axios.get('https://api.github.com/user', {
+        headers: {
+          Authorization: `token ${localToken}`,
+        },
+      });
+
+      setUserInfo(response.data);
+      dispatch({ type: 'SET_GITHUB_TOKEN', payload: localToken });
+      setTokenError('');
+    } catch (error) {
+      const friendly = formatGithubError(error, 'Invalid token');
+      setTokenError(friendly);
+      setUserInfo(null);
+    }
+  };
 
   const analyzeRepository = async () => {
     if (!localRepoUrl || !localRepoUrl.includes('github.com')) {
@@ -37,17 +64,23 @@ const ProjectAnalyzer = () => {
       const owner = parts[0];
       const repo = parts[1].replace('.git', '');
       
+      // Prepare headers (use token if available)
+      const headers = {
+        Accept: 'application/vnd.github.v3+json',
+        ...(state.githubToken ? { Authorization: `token ${state.githubToken}` } : {})
+      };
+
       // Step 1: Get repository info
       dispatch({ type: 'ADD_LOG', payload: { type: 'info', message: 'Fetching repository information...' } });
-      
-      const repoResponse = await axios.get(`https://api.github.com/repos/${owner}/${repo}`);
-      
+
+      const repoResponse = await axios.get(`https://api.github.com/repos/${owner}/${repo}`, { headers });
+
       const repoInfo = repoResponse.data;
       
       // Step 2: Get repository contents
       dispatch({ type: 'ADD_LOG', payload: { type: 'info', message: 'Analyzing repository structure...' } });
       
-      const contentsResponse = await axios.get(`https://api.github.com/repos/${owner}/${repo}/contents`);
+      const contentsResponse = await axios.get(`https://api.github.com/repos/${owner}/${repo}/contents`, { headers });
       const contents = contentsResponse.data;
       
       // Step 3: Find package.json, requirements.txt, etc. to identify dependencies
@@ -64,10 +97,46 @@ const ProjectAnalyzer = () => {
         deployment: []
       };
       
+      // Helper to fetch file contents via GitHub API (returns decoded text)
+      const fetchContentViaApi = async (filePath) => {
+        try {
+          const contentUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${repoInfo.default_branch}`;
+          const resp = await axios.get(contentUrl, { headers });
+          if (resp.data && resp.data.content) {
+            if (resp.data.encoding === 'base64') {
+              try {
+                const decoded = atob(resp.data.content);
+                return decodeURIComponent(Array.prototype.map.call(decoded, c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+              } catch (e) {
+                return atob(resp.data.content);
+              }
+            }
+            return resp.data.content;
+          }
+          return '';
+        } catch (err) {
+          console.error('Error fetching file via API:', err);
+          // Fallback to download_url which may be blocked by CORS
+          try {
+            const fallback = await axios.get(`https://raw.githubusercontent.com/${owner}/${repo}/${repoInfo.default_branch}/${filePath}`);
+            return fallback.data;
+          } catch (fb) {
+            console.error('Fallback raw fetch failed:', fb);
+            return '';
+          }
+        }
+      };
+
       // Process package.json for Node.js projects
       if (packageJsonFile) {
-        const packageJsonResponse = await axios.get(packageJsonFile.download_url);
-        const packageJson = packageJsonResponse.data;
+        const packageJsonText = await fetchContentViaApi(packageJsonFile.path);
+        let packageJson = {};
+        try {
+          packageJson = typeof packageJsonText === 'string' ? JSON.parse(packageJsonText) : packageJsonText;
+        } catch (e) {
+          console.error('Failed to parse package.json:', e);
+          packageJson = {};
+        }
         
         // Extract dependencies
         const prodDeps = packageJson.dependencies || {};
@@ -107,8 +176,8 @@ const ProjectAnalyzer = () => {
       
       // Process requirements.txt for Python projects
       if (requirementsFile) {
-        const requirementsResponse = await axios.get(requirementsFile.download_url);
-        const requirements = requirementsResponse.data.split('\n').filter(Boolean);
+        const requirementsText = await fetchContentViaApi(requirementsFile.path);
+        const requirements = (requirementsText || '').split('\n').filter(Boolean);
         
         for (const requirement of requirements) {
           const [name, version] = requirement.split('==');
@@ -147,15 +216,16 @@ const ProjectAnalyzer = () => {
       
     } catch (error) {
       console.error('Analysis error:', error);
+      const friendly = formatGithubError(error, 'Repository analysis failed');
       dispatch({ 
         type: 'SET_ERROR', 
-        payload: error.response?.data?.message || error.message
+        payload: friendly
       });
       dispatch({ 
         type: 'ADD_LOG', 
         payload: { 
           type: 'error', 
-          message: `Error: ${error.response?.data?.message || error.message}` 
+          message: friendly
         }
       });
     } finally {
@@ -175,10 +245,88 @@ const ProjectAnalyzer = () => {
         <p className="text-dark-300">Clone and analyze any repository to detect tech stack and dependencies</p>
       </motion.div>
 
+      {/* GitHub Token Configuration */}
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.1 }}
+        className="bg-dark-800 rounded-xl p-6 border border-dark-700"
+      >
+        <h3 className="text-xl font-semibold text-white mb-4 flex items-center">
+          <SafeIcon icon={FiKey} className="w-5 h-5 mr-2 text-primary-400" />
+          GitHub Token (Optional)
+        </h3>
+        
+        {!userInfo ? (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-dark-400 mb-2">
+                Personal Access Token (Increases API rate limits)
+              </label>
+              <input
+                type="password"
+                value={localToken}
+                onChange={(e) => setLocalToken(e.target.value)}
+                placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                className="w-full px-4 py-3 bg-dark-700 text-white rounded-lg border border-dark-600 focus:border-primary-500 focus:outline-none"
+              />
+              {tokenError && (
+                <p className="text-red-400 text-sm mt-2 flex items-center">
+                  <SafeIcon icon={FiAlertCircle} className="w-4 h-4 mr-1" />
+                  {tokenError}
+                </p>
+              )}
+            </div>
+            
+            <div className="bg-dark-700 rounded-lg p-4">
+              <h4 className="text-white font-medium mb-2">How to get a GitHub Token:</h4>
+              <ol className="text-dark-300 text-sm space-y-2 list-decimal list-inside">
+                <li>Go to <a href="https://github.com/settings/tokens" target="_blank" rel="noopener noreferrer" className="text-primary-400 hover:underline">GitHub Settings → Personal access tokens</a></li>
+                <li>Click <strong className="text-white">"Generate new token (classic)"</strong></li>
+                <li>
+                  Select scope: <code className="bg-dark-600 px-1 rounded">public_repo</code> (for public repos) or <code className="bg-dark-600 px-1 rounded">repo</code> (for private repos)
+                </li>
+                <li>Set expiration and click "Generate token"</li>
+                <li>Copy the token immediately</li>
+              </ol>
+              <p className="text-xs text-dark-400 mt-2">Note: Token is optional but prevents rate limit errors</p>
+            </div>
+            
+            <button
+              onClick={handleTokenSave}
+              disabled={!localToken}
+              className="px-6 py-3 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
+            >
+              Validate Token
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between p-4 bg-green-500/10 border border-green-500/20 rounded-lg">
+            <div className="flex items-center space-x-3">
+              <SafeIcon icon={FiCheck} className="w-5 h-5 text-green-400" />
+              <div>
+                <p className="text-white font-medium">Connected as {userInfo.login}</p>
+                <p className="text-dark-300 text-sm">{userInfo.name || 'No name set'}</p>
+              </div>
+            </div>
+            <button
+              onClick={() => {
+                setUserInfo(null);
+                setLocalToken('');
+                dispatch({ type: 'SET_GITHUB_TOKEN', payload: '' });
+              }}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-all duration-200"
+            >
+              Disconnect
+            </button>
+          </div>
+        )}
+      </motion.div>
+
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.2 }}
         className="bg-dark-800 rounded-xl p-6 border border-dark-700"
       >
         <h3 className="text-xl font-semibold text-white mb-4 flex items-center">

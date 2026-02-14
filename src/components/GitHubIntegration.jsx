@@ -4,6 +4,7 @@ import { useProject } from '../context/ProjectContext';
 import SafeIcon from '../common/SafeIcon';
 import * as FiIcons from 'react-icons/fi';
 import axios from 'axios';
+import { formatGithubError } from '../utils/githubHelpers';
 
 const { 
   FiGithub, FiKey, FiUpload, FiCheck, FiX, FiSettings, 
@@ -42,7 +43,8 @@ const GitHubIntegration = () => {
       dispatch({ type: 'SET_GITHUB_TOKEN', payload: token });
       return true;
     } catch (error) {
-      setTokenError(error.response?.data?.message || 'Invalid token');
+      const friendly = formatGithubError(error, 'Invalid token');
+      setTokenError(friendly);
       setUserInfo(null);
       return false;
     }
@@ -76,21 +78,28 @@ const GitHubIntegration = () => {
       if (state.repoUrl && state.currentProject.owner && state.currentProject.repo) {
         dispatch({ type: 'ADD_LOG', payload: { type: 'info', message: 'Fetching project files...' } });
         
-        // Recursively fetch all files in the repository
+        // Use Git Trees API to quickly list all files (no content)
+        const headers = {
+          Accept: 'application/vnd.github.v3+json',
+          ...(localToken ? { 'Authorization': `token ${localToken}` } : {})
+        };
+
         const files = await fetchRepositoryFiles(
           state.currentProject.owner,
-          state.currentProject.repo, 
-          state.currentProject.branch || 'main'
+          state.currentProject.repo,
+          state.currentProject.branch || state.currentProject.branch || 'main',
+          headers
         );
-        
+
         setProjectFiles(files);
         return files;
       }
       
       return [];
     } catch (error) {
+      const friendly = formatGithubError(error, 'Error fetching project files');
       console.error('Error fetching project files:', error);
-      dispatch({ type: 'ADD_LOG', payload: { type: 'error', message: `Error fetching project files: ${error.message}` } });
+      dispatch({ type: 'ADD_LOG', payload: { type: 'error', message: `Error fetching project files: ${friendly}` } });
       return [];
     } finally {
       setIsLoadingProjectFiles(false);
@@ -98,54 +107,50 @@ const GitHubIntegration = () => {
   };
 
   // Recursively fetch all files in a repository
-  const fetchRepositoryFiles = async (owner, repo, branch, path = '') => {
+  // Use Git Trees API to list all files quickly (no content fetched)
+  const fetchRepositoryFiles = async (owner, repo, branch, headers) => {
     try {
-      const url = path 
-        ? `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}`
-        : `https://api.github.com/repos/${owner}/${repo}/contents?ref=${branch}`;
-        
-      const response = await axios.get(url, {
-        headers: {
-          'Accept': 'application/vnd.github.v3+json',
-          ...(localToken ? { 'Authorization': `token ${localToken}` } : {})
-        }
-      });
-      
-      let files = [];
-      
-      for (const item of response.data) {
-        if (item.type === 'file') {
-          // Skip large files and binary files
-          if (item.size > 1000000 || isBinaryFilename(item.name)) {
-            console.log(`Skipping large or binary file: ${item.path} (${item.size} bytes)`);
-            continue;
-          }
-          
-          // Fetch file content
-          const contentResponse = await axios.get(item.download_url);
-          
+      // Ensure headers provided
+      const apiHeaders = headers || {
+        Accept: 'application/vnd.github.v3+json',
+        ...(localToken ? { 'Authorization': `token ${localToken}` } : {})
+      };
+
+      // Get tree SHA for the branch
+      const branchResp = await axios.get(`https://api.github.com/repos/${owner}/${repo}/branches/${branch}`, { headers: apiHeaders });
+      const treeSha = branchResp.data?.commit?.commit?.tree?.sha || branchResp.data?.commit?.commit?.tree?.sha;
+
+      if (!treeSha) {
+        throw new Error('Could not determine tree SHA for branch ' + branch);
+      }
+
+      const treeResp = await axios.get(`https://api.github.com/repos/${owner}/${repo}/git/trees/${treeSha}?recursive=1`, { headers: apiHeaders });
+      const tree = treeResp.data?.tree || [];
+
+      const files = [];
+      for (const entry of tree) {
+        if (entry.type === 'blob') {
+          const name = entry.path.split('/').pop();
+          if (isBinaryFilename(name)) continue;
+          // Skip very large blobs if size provided
+          if (entry.size && entry.size > 1000000) continue;
+
           files.push({
-            path: item.path,
-            content: contentResponse.data,
-            type: getFileType(item.name),
-            size: item.size
+            path: entry.path,
+            name: name,
+            size: entry.size || 0,
+            type: getFileType(name),
+            // content will be fetched lazily when needed
+            content: null
           });
-          
-        } else if (item.type === 'dir') {
-          // Skip node_modules and other large directories
-          if (['node_modules', '.git', 'dist', 'build', 'coverage'].includes(item.name)) {
-            continue;
-          }
-          
-          // Recursively fetch files in subdirectories
-          const subFiles = await fetchRepositoryFiles(owner, repo, branch, item.path);
-          files = [...files, ...subFiles];
         }
       }
-      
+
       return files;
     } catch (error) {
-      console.error(`Error fetching files at ${path}:`, error);
+      const friendly = formatGithubError(error, `Error listing repository files`);
+      console.error('Error listing repository files:', error);
+      dispatch({ type: 'ADD_LOG', payload: { type: 'error', message: friendly } });
       return [];
     }
   };
@@ -330,7 +335,7 @@ npm run dev
       await pushFilesToRepo(response.data);
       
     } catch (error) {
-      const errorMessage = error.response?.data?.message || error.message;
+      const errorMessage = formatGithubError(error, 'Error creating repository');
       dispatch({ type: 'SET_ERROR', payload: errorMessage });
       dispatch({ type: 'ADD_LOG', payload: { type: 'error', message: `Error creating repository: ${errorMessage}` } });
     } finally {
@@ -350,42 +355,116 @@ npm run dev
     }
     
     try {
-      dispatch({ type: 'ADD_LOG', payload: { type: 'info', message: `Pushing ${files.length} files to repository...` } });
+      dispatch({ type: 'ADD_LOG', payload: { type: 'info', message: 'Fetching project files...' } });
       
-      // Create files one by one
-      for (const file of files) {
-        dispatch({ type: 'ADD_LOG', payload: { type: 'info', message: `Creating ${file.path}...` } });
+      // Ensure content is loaded for files that came from the repository listing
+      // Fetch file contents in parallel batches for better performance
+      const filesToFetch = files.filter(file => (file.content === null || file.content === undefined) && state.currentProject);
+      
+      if (filesToFetch.length > 0) {
+        const batchSize = 10; // Fetch 10 files at a time
+        const totalBatches = Math.ceil(filesToFetch.length / batchSize);
         
-        try {
-          // For text files, we need to encode content
-          const content = typeof file.content === 'string' 
-            ? btoa(unescape(encodeURIComponent(file.content))) // Base64 encode text
-            : btoa(String.fromCharCode.apply(null, new Uint8Array(file.content))); // Binary content
+        for (let batchNum = 0; batchNum < totalBatches; batchNum++) {
+          const start = batchNum * batchSize;
+          const end = Math.min(start + batchSize, filesToFetch.length);
+          const batch = filesToFetch.slice(start, end);
           
-          await axios.put(`https://api.github.com/repos/${userInfo.login}/${repoName}/contents/${file.path}`, {
-            message: `Add ${file.path}`,
-            content: content,
-            branch: 'main'
-          }, {
-            headers: {
-              'Authorization': `token ${localToken}`,
-              'Accept': 'application/vnd.github.v3+json'
-            }
+          dispatch({ 
+            type: 'ADD_LOG', 
+            payload: { 
+              type: 'info', 
+              message: `Loading files ${start + 1}-${end} of ${filesToFetch.length}...` 
+            } 
           });
           
-          dispatch({ type: 'ADD_LOG', payload: { type: 'success', message: `✓ ${file.path} created successfully` } });
-        } catch (error) {
-          dispatch({ type: 'ADD_LOG', payload: { type: 'error', message: `Error pushing ${file.path}: ${error.message}` } });
-          console.error(`Error pushing ${file.path}:`, error);
-          // Continue with other files
+          // Fetch batch in parallel
+          await Promise.all(batch.map(async (file) => {
+            try {
+              const headers = {
+                'Accept': 'application/vnd.github.v3+json',
+                ...(localToken ? { 'Authorization': `token ${localToken}` } : {})
+              };
+
+              const contentResp = await axios.get(
+                `https://api.github.com/repos/${state.currentProject.owner}/${state.currentProject.repo}/contents/${file.path}?ref=${state.currentProject.branch || 'main'}`,
+                { headers }
+              );
+
+              if (contentResp.data && contentResp.data.content) {
+                if (contentResp.data.encoding === 'base64') {
+                  try {
+                    const decoded = atob(contentResp.data.content);
+                    file.content = decodeURIComponent(Array.prototype.map.call(decoded, c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+                  } catch (e) {
+                    file.content = atob(contentResp.data.content);
+                  }
+                } else {
+                  file.content = contentResp.data.content;
+                }
+              }
+            } catch (error) {
+              console.error(`Error fetching content for ${file.path}:`, error);
+              // Skip this file if we can't fetch it
+              file.content = `# Error loading file: ${file.path}`;
+            }
+          }));
         }
+      }
+      
+      dispatch({ type: 'ADD_LOG', payload: { type: 'info', message: `Pushing ${files.length} files to repository...` } });
+      
+      // Now proceed to push files in parallel batches
+      const pushBatchSize = 5; // Push 5 files at a time
+      const totalPushBatches = Math.ceil(files.length / pushBatchSize);
+      
+      for (let batchNum = 0; batchNum < totalPushBatches; batchNum++) {
+        const start = batchNum * pushBatchSize;
+        const end = Math.min(start + pushBatchSize, files.length);
+        const batch = files.slice(start, end);
+        
+        dispatch({ 
+          type: 'ADD_LOG', 
+          payload: { 
+            type: 'info', 
+            message: `Pushing files ${start + 1}-${end} of ${files.length}...` 
+          } 
+        });
+        
+        // Push batch in parallel
+        await Promise.all(batch.map(async (file) => {
+          try {
+            // For text files, we need to encode content
+            const content = typeof file.content === 'string' 
+              ? btoa(unescape(encodeURIComponent(file.content))) // Base64 encode text
+              : btoa(String.fromCharCode.apply(null, new Uint8Array(file.content))); // Binary content
+            
+            await axios.put(`https://api.github.com/repos/${userInfo.login}/${repoName}/contents/${file.path}`, {
+              message: `Add ${file.path}`,
+              content: content,
+              branch: 'main'
+            }, {
+              headers: {
+                'Authorization': `token ${localToken}`,
+                'Accept': 'application/vnd.github.v3+json'
+              }
+            });
+            
+            dispatch({ type: 'ADD_LOG', payload: { type: 'success', message: `✓ ${file.path}` } });
+          } catch (error) {
+            const friendly = formatGithubError(error, `Error pushing ${file.path}`);
+            dispatch({ type: 'ADD_LOG', payload: { type: 'error', message: `✗ ${file.path}: ${friendly}` } });
+            console.error(`Error pushing ${file.path}:`, error);
+            // Continue with other files
+          }
+        }));
       }
       
       dispatch({ type: 'ADD_LOG', payload: { type: 'success', message: 'Repository files pushed successfully!' } });
       dispatch({ type: 'ADD_LOG', payload: { type: 'info', message: `Repository URL: ${repoData.html_url}` } });
       
     } catch (error) {
-      const errorMessage = error.response?.data?.message || error.message;
+      const errorMessage = formatGithubError(error, 'Error pushing files');
       dispatch({ type: 'SET_ERROR', payload: errorMessage });
       dispatch({ type: 'ADD_LOG', payload: { type: 'error', message: `Error pushing files: ${errorMessage}` } });
     } finally {
@@ -472,13 +551,30 @@ npm run dev
               )}
             </div>
             
+            <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 mb-4">
+              <p className="text-yellow-400 text-sm font-medium mb-1 flex items-center">
+                <SafeIcon icon={FiAlertCircle} className="w-4 h-4 mr-2" />
+                Important: Token must have <code className="bg-yellow-600/20 px-1 rounded mx-1">repo</code> scope
+              </p>
+              <p className="text-dark-300 text-xs">
+                Without the <code className="bg-dark-600 px-1 rounded">repo</code> scope, you'll get "Resource not accessible" errors when creating repositories.
+              </p>
+            </div>
+
             <div className="bg-dark-700 rounded-lg p-4">
               <h4 className="text-white font-medium mb-2">How to get a GitHub Token:</h4>
-              <ol className="text-dark-300 text-sm space-y-1 list-decimal list-inside">
-                <li>Go to GitHub Settings → Developer settings → Personal access tokens</li>
-                <li>Click "Generate new token (classic)"</li>
-                <li>Select scopes: <code className="bg-dark-600 px-1 rounded">repo</code> and <code className="bg-dark-600 px-1 rounded">user</code></li>
-                <li>Copy the generated token</li>
+              <ol className="text-dark-300 text-sm space-y-2 list-decimal list-inside">
+                <li>Go to <a href="https://github.com/settings/tokens" target="_blank" rel="noopener noreferrer" className="text-primary-400 hover:underline">GitHub Settings → Personal access tokens</a></li>
+                <li>Click <strong className="text-white">"Generate new token (classic)"</strong></li>
+                <li className="font-semibold text-white">
+                  IMPORTANT: Select these scopes:
+                  <ul className="ml-6 mt-1 space-y-1 font-normal text-dark-300">
+                    <li>✓ <code className="bg-dark-600 px-1 rounded">repo</code> - Full control of private repositories (Required!)</li>
+                    <li>✓ <code className="bg-dark-600 px-1 rounded">user</code> - Read user profile data</li>
+                  </ul>
+                </li>
+                <li>Set an expiration date (recommended: 90 days)</li>
+                <li>Click "Generate token" and copy it immediately (you won't see it again!)</li>
               </ol>
             </div>
             

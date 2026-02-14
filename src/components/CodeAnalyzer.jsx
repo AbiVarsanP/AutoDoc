@@ -88,6 +88,48 @@ const CodeAnalyzer = () => {
     return iconMap[type] || FiFile;
   };
 
+  // Helper: extract JSON by matching balanced braces
+  const extractJsonFromText = (s) => {
+    if (!s || typeof s !== 'string') return null;
+    const starts = [];
+    for (let i = 0; i < s.length; i++) if (s[i] === '{') starts.push(i);
+    for (const start of starts) {
+      let depth = 0;
+      for (let i = start; i < s.length; i++) {
+        if (s[i] === '{') depth++;
+        else if (s[i] === '}') {
+          depth--;
+          if (depth === 0) {
+            const candidate = s.slice(start, i + 1);
+            try {
+              return JSON.parse(candidate);
+            } catch (e) {
+              break;
+            }
+          }
+        }
+      }
+    }
+    return null;
+  };
+
+  // Helper: extract JSON from code fences (```json or ```python blocks)
+  const extractJsonFromFences = (s) => {
+    if (!s || typeof s !== 'string') return null;
+    const fenceRegex = /```(?:json|python|py|txt)?\n([\s\S]*?)```/gi;
+    let m;
+    while ((m = fenceRegex.exec(s)) !== null) {
+      const block = m[1].trim();
+      try {
+        return JSON.parse(block);
+      } catch (e) {
+        const parsed = extractJsonFromText(block);
+        if (parsed) return parsed;
+      }
+    }
+    return null;
+  };
+
   // Function to fetch repository files
   const fetchRepositoryFiles = async () => {
     if (!state.currentProject) return;
@@ -98,9 +140,14 @@ const CodeAnalyzer = () => {
     try {
       const { owner, repo } = state.currentProject;
       const branch = state.currentProject.branch || 'main';
-      
+      // Prepare headers (use token if available)
+      const headers = {
+        Accept: 'application/vnd.github.v3+json',
+        ...(state.githubToken ? { Authorization: `token ${state.githubToken}` } : {})
+      };
+
       // Fetch all files recursively
-      const allFiles = await fetchAllFiles(owner, repo, branch);
+      const allFiles = await fetchAllFiles(owner, repo, branch, '', headers);
       setFiles(allFiles);
       
     } catch (error) {
@@ -112,39 +159,38 @@ const CodeAnalyzer = () => {
   };
 
   // Recursive function to fetch all files from repository
-  const fetchAllFiles = async (owner, repo, branch, path = '') => {
+  // Use Git Trees API to list repository files quickly
+  const fetchAllFiles = async (owner, repo, branch, path = '', headers) => {
     try {
-      const url = path 
-        ? `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}`
-        : `https://api.github.com/repos/${owner}/${repo}/contents?ref=${branch}`;
-      
-      const response = await axios.get(url);
-      let allFiles = [];
+      const apiHeaders = headers || {
+        Accept: 'application/vnd.github.v3+json',
+        ...(state.githubToken ? { Authorization: `token ${state.githubToken}` } : {})
+      };
 
-      for (const item of response.data) {
-        if (item.type === 'file') {
-          // Skip binary files and very large files
-          if (item.size > 1000000 || isBinaryFile(item.name)) {
-            continue;
-          }
+      // Get tree SHA for the branch
+      const branchResp = await axios.get(`https://api.github.com/repos/${owner}/${repo}/branches/${branch}`, { headers: apiHeaders });
+      const treeSha = branchResp.data?.commit?.commit?.tree?.sha;
+
+      if (!treeSha) return [];
+
+      const treeResp = await axios.get(`https://api.github.com/repos/${owner}/${repo}/git/trees/${treeSha}?recursive=1`, { headers: apiHeaders });
+      const tree = treeResp.data?.tree || [];
+
+      const allFiles = [];
+      for (const entry of tree) {
+        if (entry.type === 'blob') {
+          const name = entry.path.split('/').pop();
+          if (isBinaryFile(name)) continue;
+          if (entry.size && entry.size > 1000000) continue;
 
           allFiles.push({
-            name: item.name,
-            path: item.path,
-            type: getFileType(item.name),
-            size: item.size,
-            downloadUrl: item.download_url,
+            name,
+            path: entry.path,
+            type: getFileType(name),
+            size: entry.size || 0,
+            downloadUrl: `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${entry.path}`,
             isDirectory: false
           });
-        } else if (item.type === 'dir') {
-          // Skip common directories that are usually not needed for analysis
-          if (['node_modules', '.git', 'dist', 'build', 'coverage', '.next', 'out'].includes(item.name)) {
-            continue;
-          }
-
-          // Recursively fetch files from subdirectories
-          const subFiles = await fetchAllFiles(owner, repo, branch, item.path);
-          allFiles = [...allFiles, ...subFiles];
         }
       }
 
@@ -176,8 +222,37 @@ const CodeAnalyzer = () => {
 
     try {
       setError('');
-      const response = await axios.get(file.downloadUrl);
-      const content = response.data;
+      // Fetch file content via GitHub API to avoid raw.githubusercontent CORS and 403 issues
+      if (!state.currentProject) throw new Error('No current project');
+      const owner = state.currentProject.owner;
+      const repo = state.currentProject.repo;
+      const branch = state.currentProject.branch || state.currentProject.branch || 'main';
+
+      const headers = {
+        Accept: 'application/vnd.github.v3+json',
+        ...(state.githubToken ? { Authorization: `token ${state.githubToken}` } : {})
+      };
+
+      const contentUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}?ref=${branch}`;
+      const response = await axios.get(contentUrl, { headers });
+
+      let content = '';
+      if (response.data && response.data.content) {
+        if (response.data.encoding === 'base64') {
+          try {
+            const decoded = atob(response.data.content);
+            content = decodeURIComponent(Array.prototype.map.call(decoded, c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+          } catch (e) {
+            content = atob(response.data.content);
+          }
+        } else {
+          content = response.data.content;
+        }
+      } else if (file.downloadUrl) {
+        // Fallback to download_url (may be blocked by CORS)
+        const fallback = await axios.get(file.downloadUrl);
+        content = fallback.data;
+      }
       
       // Update file with content
       const updatedFile = { ...file, content };
@@ -196,8 +271,8 @@ const CodeAnalyzer = () => {
 
   // Function to analyze code using Groq API with supported model
   const analyzeCode = async () => {
-    if (!selectedFile || !fileContent || !apiKey) {
-      setError('Please select a file and enter your Groq API key');
+    if (!selectedFile || !fileContent) {
+      setError('Please select a file to analyze');
       return;
     }
 
@@ -207,55 +282,63 @@ const CodeAnalyzer = () => {
 
     try {
       // Using llama3-8b-8192 instead of deprecated mixtral-8x7b-32768
-      const response = await axios.post(
-        'https://api.groq.com/openai/v1/chat/completions',
-        {
-          model: 'llama3-8b-8192',
-          messages: [
-            {
-              role: 'system',
-              content: `You are an expert code analyzer. Analyze the following code and provide a detailed analysis in JSON format with the following structure:
-              {
-                "errors": [{ "line": number, "code": "problematic code", "message": "error description", "severity": "high/medium/low" }],
-                "warnings": [{ "line": number, "code": "problematic code", "message": "warning description", "severity": "high/medium/low" }],
-                "suggestions": [{ "line": number, "code": "code segment", "message": "improvement suggestion", "severity": "high/medium/low" }],
-                "summary": { "errorCount": number, "warningCount": number, "suggestionCount": number }
-              }
-              Focus on:
-              1. Syntax errors and potential bugs
-              2. Security vulnerabilities
-              3. Performance issues
-              4. Code style and best practices
-              5. Possible improvements
-              Be specific about line numbers and provide clear, actionable feedback.`
-            },
-            {
-              role: 'user',
-              content: `Analyze this ${selectedFile.type} code from file "${selectedFile.name}":\n\n${fileContent}`
-            }
-          ],
-          temperature: 0.1,
-          max_tokens: 4000,
-          top_p: 1
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json'
-          }
-        }
+      // Resolve backend URL: prefer Vite env, fallback to CRA env, then localhost
+      const viteUrl = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_ANALYSIS_API_URL) ? import.meta.env.VITE_ANALYSIS_API_URL : null;
+      const craUrl = (typeof process !== 'undefined' && process.env && process.env.REACT_APP_ANALYSIS_API_URL) ? process.env.REACT_APP_ANALYSIS_API_URL : null;
+      const backendBase = viteUrl || craUrl || 'http://localhost:8000';
+      const backendBaseUrl = backendBase.replace(/\/$/, '');
+
+      // Submit async job to backend
+      const submitUrl = `${backendBaseUrl}/analyze_async`;
+      const submitResp = await axios.post(
+        submitUrl,
+        { code: fileContent, fileName: selectedFile?.name || '', fileType: selectedFile?.type || '' },
+        { headers: { 'Content-Type': 'application/json' } }
       );
 
-      const analysisContent = response.data.choices[0].message.content;
+      const jobId = submitResp.data?.job_id;
+      if (!jobId) throw new Error('No job id returned from analysis server');
+
+      // Poll for job status
+      const statusUrl = `${backendBaseUrl}/status/${jobId}`;
+      let pollCount = 0;
+      let jobData = null;
+      while (pollCount < 120) { // timeout after ~120s
+        await new Promise(res => setTimeout(res, 1000));
+        pollCount++;
+        try {
+          const statusResp = await axios.get(statusUrl);
+          jobData = statusResp.data;
+          if (jobData.status === 'done' || jobData.status === 'failed') break;
+        } catch (e) {
+          // ignore transient errors while polling
+        }
+      }
+
+      if (!jobData) throw new Error('Analysis job timed out');
+      if (jobData.status === 'failed') throw new Error(jobData.error || 'Analysis failed');
+
+      let analysisContent = jobData.result;
       
       try {
-        // Try to parse JSON response
-        const jsonMatch = analysisContent.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const jsonResult = JSON.parse(jsonMatch[0]);
-          setAnalysisResult(jsonResult);
+        // If backend returned structured JSON, use it; otherwise try to extract JSON from string
+        if (typeof analysisContent === 'object') {
+          setAnalysisResult(analysisContent);
+        } else if (typeof analysisContent === 'string') {
+          // Try extracting JSON from code fences first, then balanced-brace parsing
+          const fromFences = extractJsonFromFences(analysisContent);
+          if (fromFences) {
+            setAnalysisResult(fromFences);
+          } else {
+            const fromBraces = extractJsonFromText(analysisContent);
+            if (fromBraces) {
+              setAnalysisResult(fromBraces);
+            } else {
+              throw new Error('No JSON found in response');
+            }
+          }
         } else {
-          throw new Error('No JSON found in response');
+          throw new Error('Unexpected analysis response format');
         }
       } catch (jsonError) {
         // If JSON parsing fails, create a structured response
